@@ -1,12 +1,26 @@
-patterns = [
+apatterns = [
     # API keys and tokens
     r'api[_-]?key\s*[:=]\s*[\'"]?([A-Za-z0-9_\-]{16,})[\'"]?',  # Matches API keys like api_key="xyz" or apiKey: xyz
     r'(?:secret|token)[_-]?key\s*[:=]\s*[\'"]?([A-Za-z0-9_\-]{16,})[\'"]?',  # Matches secretKey="xyz" or token_key: xyz
 
-    # Passwords
-    r'\b[Pp]assword\s*[:=]\s*[\'"]([^\'"]+)[\'"]',  # Matches password="xyz" or password='xyz'
-    r'\b[Pp]assword\s*[:=]\s*([^\s;]+)',  # Matches password=xyz without quotes
-    r'\b[Pp]ass(?:word)?\s*[:=]\s*[\'"]([^\'"]+)[\'"]',  # Matches variations like pass="xyz"
+    # Password assignments
+    r'\b[Pp]assword\s*=\s*["\']([^"\']+)["\']',  # Matches password="value" or password='value'
+    r'\b[Pp]assword\s*=\s*([^\s\'";]+)',  # Matches password=value without quotes
+
+    # API key/token assignments
+    r'\b[Aa]pi[_-]?[Kk]ey\s*=\s*["\']([^"\']+)["\']',  # Matches apiKey="value" or api_key='value'
+    r'\b[Aa]pi[_-]?[Tt]oken\s*=\s*["\']([^"\']+)["\']',  # Matches apiToken="value" or api_token='value'
+
+    # Secret key assignments
+    r'\b[Ss]ecret[_-]?[Kk]ey\s*=\s*["\']([^"\']+)["\']',  # Matches secretKey="value" or secret_key='value'
+
+    # Generic sensitive key or token assignments
+    r'\b[Tt]oken\s*=\s*["\']([^"\']+)["\']',  # Matches token="value"
+    r'\b[Kk]ey\s*=\s*["\']([^"\']+)["\']',  # Matches key="value"
+
+    # Other authentication or sensitive data
+    r'\b[Aa]uth[_-]?[Tt]oken\s*=\s*["\']([^"\']+)["\']',  # Matches authToken="value"
+    r'\b[Aa]uth[_-]?[Kk]ey\s*=\s*["\']([^"\']+)["\']',  # Matches authKey="value"
 
     # Authentication secrets
     r'\b[Aa]uth(?:entication)?[_-]?[Kk]ey\s*[:=]\s*[\'"]?([A-Za-z0-9_\-]{16,})[\'"]?',  # Matches auth_key="xyz"
