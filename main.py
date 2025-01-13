@@ -1,20 +1,17 @@
 import os
 import re
+from concurrent.futures import ProcessPoolExecutor
 from patterns import patterns
-from cpp_patterns import cpp_patterns  # Assuming you have a separate file for C++ patterns
+from cpp_patterns import cpp_patterns
 
 def write_match_to_file(pattern_name, match_line, file_path, line_number, output_dir):
     """
     Writes a match to a file named after the pattern in the output directory.
     """
-    # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
-
-    # Create a safe filename for the pattern
     sanitized_name = re.sub(r'[^\w\d]', '_', pattern_name)
     output_file_path = os.path.join(output_dir, f"{sanitized_name}.txt")
 
-    # Write the match to the file
     with open(output_file_path, 'a', encoding='utf-8') as output_file:
         output_file.write(f"File: {file_path} | Line {line_number}: {match_line.strip()}\n")
 
@@ -39,34 +36,41 @@ def search_in_file(file_path, patterns, cpp_patterns, output_dir):
         with open(error_file, 'a', encoding='utf-8') as error_log:
             error_log.write(f"Error reading file {file_path}: {e}\n")
 
-def search_directory(directory, patterns, cpp_patterns, output_dir):
+def process_file(file_path, patterns, cpp_patterns, output_dir):
     """
-    Recursively searches through a directory and its files, writing matches to separate files.
+    Wrapper for search_in_file to use with parallel processing.
     """
+    search_in_file(file_path, patterns, cpp_patterns, output_dir)
+
+def search_directory_parallel(directory, patterns, cpp_patterns, output_dir):
+    """
+    Recursively searches through a directory using parallel processing.
+    """
+    file_paths = []
     for root, _, files in os.walk(directory):
         for file in files:
-            file_path = os.path.join(root, file)
-            search_in_file(file_path, patterns, cpp_patterns, output_dir)
+            file_paths.append(os.path.join(root, file))
+    
+    # Use ProcessPoolExecutor for parallel processing
+    with ProcessPoolExecutor() as executor:
+        executor.map(process_file, file_paths, [patterns] * len(file_paths), [cpp_patterns] * len(file_paths), [output_dir] * len(file_paths))
 
 def main():
     """
     Main function to take user input for directory and output directory path.
     """
-    # Get the directory path from the user
     directory = input("Enter the directory path to search: ").strip()
     if not os.path.isdir(directory):
         print(f"Error: The provided path is not a valid directory: {directory}")
         return
 
-    # Get the output directory path from the user
     output_dir = input("Enter the output directory path (e.g., output/): ").strip()
     if not output_dir:
         print("Error: Output directory path cannot be empty.")
         return
 
-    # Start the search
-    print(f"Starting search in directory: {directory}")
-    search_directory(directory, patterns, cpp_patterns, output_dir)
+    print(f"Starting parallel search in directory: {directory}")
+    search_directory_parallel(directory, patterns, cpp_patterns, output_dir)
     print(f"Search complete. Results saved in {output_dir}")
 
 if __name__ == '__main__':
