@@ -55,8 +55,8 @@ def main():
         print("Error: Output directory path cannot be empty.")
         return
 
-    print(f"Starting parallel search in directory: {directory}")
-    search_directory_parallel(directory, patterns, cpp_patterns, output_dir)
+    print(f"Starting search in directory: {directory}")
+    searchDirectory(directory, patterns, cpp_patterns, output_dir)
     print(f"Search complete. Results saved in {output_dir}")
 
     flagFile = open("flag.txt", 'a')
