@@ -1,0 +1,61 @@
+import os
+
+def count_entries_in_file(file_path):
+    """
+    Counts the number of lines in a file that start with "File: ".
+    
+    Args:
+        file_path (str): Path to the file to read.
+    
+    Returns:
+        int: The count of matching lines.
+    """
+    count = 0
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                if line.startswith("File: "):
+                    count += 1
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+    return count
+
+def process_folder(folder_path, output_file):
+    """
+    Reads all files in a folder, counts entries starting with "File: ",
+    and writes the results to an aggregate file.
+    
+    Args:
+        folder_path (str): Path to the folder containing files.
+        output_file (str): Path to the output aggregate file.
+    """
+    try:
+        with open(output_file, 'w', encoding='utf-8') as aggregate:
+            aggregate.write("=== Entry Counts per File ===\n")
+            
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    entry_count = count_entries_in_file(file_path)
+                    aggregate.write(f"{file}: {entry_count} entries\n")
+                    print(f"Processed {file}: {entry_count} entries")
+            
+        print(f"\nResults written to {output_file}")
+    except Exception as e:
+        print(f"Error writing to output file: {e}")
+
+def main():
+    folder_path = input("Enter the folder path containing files: ").strip()
+    if not os.path.isdir(folder_path):
+        print(f"Error: The provided path is not a valid directory: {folder_path}")
+        return
+
+    output_file = input("Enter the path for the aggregate output file (e.g., aggregate.txt): ").strip()
+    if not output_file:
+        print("Error: Output file path cannot be empty.")
+        return
+
+    process_folder(folder_path, output_file)
+
+if __name__ == "__main__":
+    main()
