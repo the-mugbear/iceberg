@@ -29,3 +29,8 @@ def getProcessedFiles(conn):
     cursor = conn.cursor()
     cursor.execute("SELECT file_path FROM processed_files")
     return {row[0] for row in cursor.fetchall()}
+
+def isFileProcessed(conn, file_path):
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM processed_files WHERE file_path = ?", (file_path,))
+    return cursor.fetchone() is not None
