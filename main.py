@@ -3,12 +3,10 @@ import re
 import mmap
 import time
 import math
-from queue import Queue
-from threading import Thread, Lock
+import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from tqdm import tqdm
 from itertools import islice
 
 from dbInit import initDatabase
@@ -16,192 +14,218 @@ from dbOperations import dbInsertMatches, dbInsertErrors, markFileProcessed, get
 from patterns_Secrets import secretsPatterns
 from patterns_UnsafeFunctions import cppPatterns
 
-# Precompile regex patterns for better performance
-# ----------------------------------------------
-# MULTILINE flag: ^ and $ match start/end of each line
-# DOTALL flag: . matches newline characters
-# IGNORECASE flag: case-insensitive matching
-# TODO: Evaluation of compiled vs not compiled so far negligible 
-compiled_patterns = [
-    re.compile(p, re.IGNORECASE | re.DOTALL) for p in secretsPatterns
-]
+# ========== Configuration ==========
+TEMP_MATCHES_FILE = "matches_temp.txt"
+TEMP_ERRORS_FILE = "errors_temp.txt"
+PROCESSED_FILES_BATCH_SIZE = 1000
+BATCH_SIZE = max(1500, os.cpu_count() * 500)  # For file processing
+# ===================================
+
+# Thread-safe locks for writing to temp files
+matches_lock = threading.Lock()
+errors_lock = threading.Lock()
+
+# Thread-safe counter for progress
+processed_count = 0
+processed_count_lock = threading.Lock()
+
+# Precompile regex patterns
+compiled_patterns = [re.compile(p, re.IGNORECASE | re.DOTALL) for p in secretsPatterns]
 compiled_cpp_patterns = [re.compile(p) for p in cppPatterns]
 
-# Adjust batch size based on hardware
-batch_size = max(1500, os.cpu_count() * 500)
-
-# Thread-safe counter
-processed_count = 0
-processed_count_lock = Lock()
-
-def dbWorker(queue, db_path):
+def write_matches_to_file(matches):
     """
-    Database worker thread that processes database operations from a queue.
-    
-    Threading Implementation:
-    - Each dbWorker runs in its own thread
-    - Multiple dbWorkers (up to 4) run concurrently to handle database operations
-    - Each worker has its own database connection to prevent threading issues
-    
-    Queue Operations:
-    - Workers process items from the queue until they receive None (shutdown signal)
-    - Queue items are tuples of (operation, data) where operation is one of:
-        * "matches": Insert pattern matches
-        * "errors": Insert error records
-        * "processed": Mark file as processed
-    
-    Args:
-        queue (Queue): Thread-safe queue containing database operations
-        db_path (str): Path to the SQLite database file
+    Appends matches to a shared text file in a thread-safe manner.
+    Each match is written as a CSV-like line.
     """
-    conn = initDatabase(db_path)  # Each thread gets its own connection
-    while True:
-        item = queue.get()
-        if item is None:  # Exit signal
-            break
-        operation, data = item
-        try:
-            if operation == "matches":
-                dbInsertMatches(conn, data)
-            elif operation == "errors":
-                dbInsertErrors(conn, data)
-            elif operation == "processed":
-                markFileProcessed(conn, data)
-        except Exception as e:
-            print(f"Database error during '{operation}' operation: {e}")
-        queue.task_done()
-    conn.close()
+    with matches_lock:
+        with open(TEMP_MATCHES_FILE, "a", encoding="utf-8") as f:
+            for m in matches:
+                pattern, file_path, line_number, content = m
+                # Escape or quote if needed, here we keep it simple
+                f.write(f"{pattern}|{file_path}|{line_number}|{content}\n")
 
-def searchFile(file_path, patterns, cpp_patterns, db_queue, batch_size=100):
+def write_errors_to_file(errors):
+    """
+    Appends errors to a shared text file in a thread-safe manner.
+    Each error is written as file_path|error_message.
+    """
+    with errors_lock:
+        with open(TEMP_ERRORS_FILE, "a", encoding="utf-8") as f:
+            for e in errors:
+                file_path, error_msg = e
+                f.write(f"{file_path}|{error_msg}\n")
+
+def search_file(file_path, patterns, cpp_patterns):
+    """
+    Scans a single file for matches, writes them to temp files, and notes errors if any.
+    """
     matches = []
     errors = []
 
     try:
         with open(file_path, 'rb') as file:
-            try:
-                with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
-                    content = mmapped_file.read().decode('utf-8', errors='ignore')  # Read full file content
-                    for pattern in patterns:
-                        for match in pattern.finditer(content):
-                            matches.append((pattern.pattern, file_path, 0, match.group(0)))
-                            if len(matches) >= batch_size:
-                                db_queue.put(("matches", matches))
-                                matches = []
-            except UnicodeDecodeError as e:
-                errors.append((file_path, f"Unicode decode error: {str(e)}"))
+            with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as mmapped_file:
+                content = mmapped_file.read().decode('utf-8', errors='ignore')
+                # Process secret patterns
+                for pattern in patterns:
+                    for match in pattern.finditer(content):
+                        matches.append((pattern.pattern, file_path, 0, match.group(0)))
+                # (Optional) process unsafe C++ patterns
+                for cpp_pattern in cpp_patterns:
+                    for match in cpp_pattern.finditer(content):
+                        matches.append((cpp_pattern.pattern, file_path, 0, match.group(0)))
+    except UnicodeDecodeError as e:
+        errors.append((file_path, f"Unicode decode error: {str(e)}"))
     except Exception as e:
         errors.append((file_path, f"General error: {str(e)}"))
 
+    # Write results to temp files
     if matches:
-        db_queue.put(("matches", matches))
+        write_matches_to_file(matches)
     if errors:
-        db_queue.put(("errors", errors))
+        write_errors_to_file(errors)
 
-    db_queue.put(("processed", file_path))
-
-    # Update processed count in a thread-safe manner
+    # Thread-safe increment of processed file count
     global processed_count
     with processed_count_lock:
         processed_count += 1
 
-def batchIterator(iterable, batch_size):
+def batch_iterator(iterable, batch_size):
     """
-    Creates batches of items from an iterable for efficient processing.
-    
-    Batching Strategy:
-    - Takes an iterable (like a list of file paths) and yields fixed-size batches
-    - Uses islice for memory-efficient iteration without creating intermediate lists
-    - Last batch may be smaller than batch_size
-    
-    Example:
-        Files: [f1, f2, f3, f4, f5] with batch_size=2
-        Yields: [f1, f2], [f3, f4], [f5]
-    
-    Args:
-        iterable: Input iterable to be batched
-        batch_size: Number of items per batch
-    
-    Yields:
-        Lists of items of size batch_size (or smaller for the last batch)
+    Yields lists of size batch_size from iterable until exhausted.
     """
     it = iter(iterable)
-    while batch := list(islice(it, batch_size)):
+    while True:
+        batch = list(islice(it, batch_size))
+        if not batch:
+            break
         yield batch
 
-def searchDirectory(directory, patterns, cpp_patterns, db_path):
+def load_matches_into_db(db_path):
     """
-    Main function that coordinates multi-threaded file scanning and database operations.
-    
-    Threading Architecture:
-    1. Database Workers:
-        - Multiple db_queues (up to 4) to distribute database operations
-        - Each queue has its own dbWorker thread
-        - Files are assigned to queues using hash(file_path) for even distribution
-    
-    2. File Processing Workers:
-        - ThreadPoolExecutor manages a pool of worker threads
-        - Number of workers = CPU_COUNT
-        - Each worker processes one file at a time
-        - Files are processed in batches for better efficiency
-    
-    Batch Processing Flow:
-    1. Files are gathered and filtered (by extension and already processed)
-    2. Files are divided into batches using batchIterator
-    3. Each batch is submitted to the ThreadPoolExecutor
-    4. Completed files are tracked using as_completed()
-    
-    Progress Monitoring:
-    - Tracks processed files and calculates processing rate
-    - Estimates time remaining based on current processing speed
+    Loads match records from TEMP_MATCHES_FILE into the database in big chunks,
+    then does the same for errors in TEMP_ERRORS_FILE.
     """
     conn = initDatabase(db_path)
-    processed_files = getProcessedFiles(conn)
+
+    # Bulk insert matches
+    try:
+        with open(TEMP_MATCHES_FILE, "r", encoding="utf-8") as f:
+            batch = []
+            for line in f:
+                line = line.rstrip("\n")
+                pattern, file_path, line_number, content = line.split("|", 3)
+                batch.append((pattern, file_path, line_number, content))
+                if len(batch) >= 1000:
+                    dbInsertMatches(conn, batch)
+                    batch.clear()
+            # Insert any remaining
+            if batch:
+                dbInsertMatches(conn, batch)
+    except FileNotFoundError:
+        print("No matches_temp.txt found, skipping match insertion.")
+    except Exception as e:
+        print(f"Error inserting matches: {e}")
+
+    # Bulk insert errors
+    try:
+        with open(TEMP_ERRORS_FILE, "r", encoding="utf-8") as f:
+            batch = []
+            for line in f:
+                line = line.rstrip("\n")
+                file_path, error_msg = line.split("|", 1)
+                batch.append((file_path, error_msg))
+                if len(batch) >= 1000:
+                    dbInsertErrors(conn, batch)
+                    batch.clear()
+            # Insert remainder
+            if batch:
+                dbInsertErrors(conn, batch)
+    except FileNotFoundError:
+        print("No errors_temp.txt found, skipping error insertion.")
+    except Exception as e:
+        print(f"Error inserting errors: {e}")
+
     conn.close()
 
-    file_paths = [
-        os.path.join(root, file)
-        for root, _, files in os.walk(directory)
-        for file in files
-        if os.path.join(root, file) not in processed_files
-    ]
+def mark_files_processed(db_path, processed_files):
+    """
+    Marks processed files in larger batches to reduce DB overhead.
+    """
+    conn = initDatabase(db_path)
+    batch = []
+    for file_path in processed_files:
+        batch.append(file_path)
+        if len(batch) >= PROCESSED_FILES_BATCH_SIZE:
+            for fp in batch:
+                markFileProcessed(conn, fp)
+            batch.clear()
+    if batch:
+        for fp in batch:
+            markFileProcessed(conn, fp)
+    conn.close()
+
+def search_directory(directory, patterns, cpp_patterns, db_path):
+    """
+    Main scanning function. Gathers file paths, excludes already processed,
+    spawns threads to scan them, writes results to temp files,
+    then does a final bulk insert.
+    """
+    # Prep: remove old temp files
+    for temp_file in [TEMP_MATCHES_FILE, TEMP_ERRORS_FILE]:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    # Identify files not yet processed
+    conn = initDatabase(db_path)
+    processed_db = getProcessedFiles(conn)  # set of processed paths
+    conn.close()
+
+    file_paths = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            full_path = os.path.join(root, file)
+            if full_path not in processed_db:
+                file_paths.append(full_path)
 
     print(f"Number of files to be scanned: {len(file_paths)}")
 
-    # Initialize database worker threads and queues
-    db_queue = Queue()
-    db_thread = Thread(target=dbWorker, args=(db_queue, db_path))
-    db_thread.start()
-
+    # Scan files in parallel
     start_time = time.time()
-
-    # Process files using thread pool
     with ThreadPoolExecutor() as executor:
-        total_batches = math.ceil(len(file_paths) / batch_size)
-        for batch in tqdm(batchIterator(file_paths, batch_size), total=total_batches, leave=False):
+        total_batches = math.ceil(len(file_paths) / BATCH_SIZE)
+        for batch in batch_iterator(file_paths, BATCH_SIZE):
             partial_search = partial(
-                searchFile,
-                patterns=compiled_patterns,
-                cpp_patterns=compiled_cpp_patterns,
-                db_queue=db_queue,
-                batch_size=batch_size,
+                search_file,
+                patterns=patterns,
+                cpp_patterns=cpp_patterns
             )
-            list(executor.map(partial_search, batch))  # Ensure all tasks are processed
+            # Wait for all tasks in this batch
+            list(executor.map(partial_search, batch))
 
-            # Print progress every 1000 files or 5 seconds
-            if processed_count % 1000 == 0 or time.time() - start_time >= 5:
+            # Print progress every 5 seconds or so
+            if (processed_count % 1000 == 0) or (time.time() - start_time >= 5):
                 print(f"Processed {processed_count}/{len(file_paths)} files...")
                 start_time = time.time()
 
-    db_queue.put(None)
-    db_thread.join()
+    # Mark all files as processed in the DB
+    mark_files_processed(db_path, file_paths)
+
+    # Finally bulk-insert from temp files to DB
+    load_matches_into_db(db_path)
 
 def main():
     directory = input("Enter the directory path to search: ").strip()
     if not os.path.isdir(directory):
         print(f"Error: The provided path is not a valid directory: {directory}")
         return
+
     db_path = "results.db"
-    searchDirectory(directory, compiled_patterns, compiled_cpp_patterns, db_path)
+
+    search_directory(directory, compiled_patterns, compiled_cpp_patterns, db_path)
+
+    print("Scan complete.")
 
 if __name__ == '__main__':
     main()
